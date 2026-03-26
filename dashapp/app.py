@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 from textwrap import wrap
 
@@ -580,6 +581,22 @@ def sanitize_selection(values: list[str] | None, valid_values: list[str]) -> lis
     return [value for value in (values or []) if value in valid_set]
 
 
+def freeze_filter_values(values: list[str] | None) -> tuple[str, ...]:
+    return tuple(sorted(str(value) for value in (values or []) if value))
+
+
+def freeze_filters(filters: dict[str, list[str]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return tuple((field, freeze_filter_values(filters.get(field))) for field, _, _ in OVERVIEW_FILTER_SPECS)
+
+
+def thaw_filters(filter_key: tuple[tuple[str, tuple[str, ...]], ...]) -> dict[str, list[str]]:
+    return {field: list(values) for field, values in filter_key}
+
+
+def freeze_string_values(values: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    return tuple(sorted({str(value) for value in (values or []) if str(value)}))
+
+
 def dropdown_options_from_values(values: list[str]) -> list[dict[str, str]]:
     return [{"label": value, "value": value} for value in values]
 
@@ -652,6 +669,18 @@ def apply_overview_filters(
     *,
     exclude_field: str | None = None,
 ) -> pd.DataFrame:
+    filter_key = freeze_filters(filters)
+    return _apply_overview_filters_cached(start_date, end_date, filter_key, exclude_field).copy()
+
+
+@lru_cache(maxsize=64)
+def _apply_overview_filters_cached(
+    start_date: str | None,
+    end_date: str | None,
+    filter_key: tuple[tuple[str, tuple[str, ...]], ...],
+    exclude_field: str | None = None,
+) -> pd.DataFrame:
+    filters = thaw_filters(filter_key)
     frame = OVERVIEW_HOLDINGS.copy()
     if start_date:
         frame = frame[frame["as_of_date"] >= pd.Timestamp(start_date)]
@@ -667,11 +696,37 @@ def apply_overview_filters(
     return frame
 
 
+def overview_holdings_by_date(start_date: str | None, end_date: str | None) -> pd.DataFrame:
+    return _overview_holdings_by_date_cached(start_date, end_date).copy()
+
+
+@lru_cache(maxsize=64)
+def _overview_holdings_by_date_cached(start_date: str | None, end_date: str | None) -> pd.DataFrame:
+    frame = OVERVIEW_HOLDINGS.copy()
+    if start_date:
+        frame = frame[frame["as_of_date"] >= pd.Timestamp(start_date)]
+    if end_date:
+        frame = frame[frame["as_of_date"] <= pd.Timestamp(end_date)]
+    return frame
+
+
 def overview_filter_state(
     start_date: str | None,
     end_date: str | None,
     current_filters: dict[str, list[str]],
 ) -> tuple[dict[str, list[dict[str, str]]], dict[str, list[str]], pd.DataFrame]:
+    filter_key = freeze_filters(current_filters)
+    options_by_field, sanitized_filters, filtered = _overview_filter_state_cached(start_date, end_date, filter_key)
+    return options_by_field, sanitized_filters, filtered.copy()
+
+
+@lru_cache(maxsize=64)
+def _overview_filter_state_cached(
+    start_date: str | None,
+    end_date: str | None,
+    filter_key: tuple[tuple[str, tuple[str, ...]], ...],
+) -> tuple[dict[str, list[dict[str, str]]], dict[str, list[str]], pd.DataFrame]:
+    current_filters = thaw_filters(filter_key)
     options_by_field: dict[str, list[dict[str, str]]] = {}
     sanitized_filters: dict[str, list[str]] = {}
     for field, _, _ in OVERVIEW_FILTER_SPECS:
@@ -685,7 +740,18 @@ def overview_filter_state(
 
 
 def build_overview_frame(dataset: str, start_date: str | None, end_date: str | None, filters: dict[str, list[str]]) -> pd.DataFrame:
-    frame = apply_overview_filters(start_date, end_date, filters)
+    filter_key = freeze_filters(filters)
+    return _build_overview_frame_cached(dataset, start_date, end_date, filter_key).copy()
+
+
+@lru_cache(maxsize=128)
+def _build_overview_frame_cached(
+    dataset: str,
+    start_date: str | None,
+    end_date: str | None,
+    filter_key: tuple[tuple[str, tuple[str, ...]], ...],
+) -> pd.DataFrame:
+    frame = _apply_overview_filters_cached(start_date, end_date, filter_key)
     group_column = OVERVIEW_GROUP_COLUMNS[dataset]
     frame = frame[(frame[group_column].notna()) & (frame[group_column].astype(str) != "")]
     grouped = frame.groupby(["as_of_date", group_column], as_index=False)["value"].sum()
@@ -706,6 +772,18 @@ def build_holdings_group_frame(
     exclude_groups: set[str] | None = None,
     unknown_label: str | None = None,
 ) -> pd.DataFrame:
+    exclude_key = tuple(sorted(exclude_groups or set()))
+    return _build_holdings_group_frame_cached(group_column, start_date, end_date, exclude_key, unknown_label).copy()
+
+
+@lru_cache(maxsize=64)
+def _build_holdings_group_frame_cached(
+    group_column: str,
+    start_date: str | None,
+    end_date: str | None,
+    exclude_key: tuple[str, ...],
+    unknown_label: str | None = None,
+) -> pd.DataFrame:
     frame = OVERVIEW_HOLDINGS.copy()
     if start_date:
         frame = frame[frame["as_of_date"] >= pd.Timestamp(start_date)]
@@ -719,9 +797,37 @@ def build_holdings_group_frame(
     grouped = grouped.merge(totals, on="as_of_date", how="left")
     grouped["share"] = grouped["value"] / grouped["total_value"]
     grouped["group_name"] = grouped[group_column].astype(str)
-    if exclude_groups:
-        grouped = grouped[~grouped["group_name"].isin(exclude_groups)].copy()
+    if exclude_key:
+        grouped = grouped[~grouped["group_name"].isin(exclude_key)].copy()
     return grouped[["as_of_date", "group_name", "value", "share"]].sort_values(["as_of_date", "value"], ascending=[True, False])
+
+
+def detail_frame_by_date(start_date: str, end_date: str) -> pd.DataFrame:
+    return _detail_frame_by_date_cached(start_date, end_date).copy()
+
+
+@lru_cache(maxsize=64)
+def _detail_frame_by_date_cached(start_date: str, end_date: str) -> pd.DataFrame:
+    return FUND_DETAIL_HOLDINGS[
+        (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
+        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
+    ].copy()
+
+
+def detail_frame_for_subset(start_date: str, end_date: str, subset_by: str, selected_values: list[str] | None) -> pd.DataFrame:
+    subset_key = freeze_string_values(selected_values)
+    return _detail_frame_for_subset_cached(start_date, end_date, subset_by, subset_key).copy()
+
+
+@lru_cache(maxsize=128)
+def _detail_frame_for_subset_cached(
+    start_date: str,
+    end_date: str,
+    subset_by: str,
+    subset_key: tuple[str, ...],
+) -> pd.DataFrame:
+    frame = _detail_frame_by_date_cached(start_date, end_date)
+    return filter_maturity_subset(frame, subset_by, list(subset_key)).copy()
 
 
 def selected_groups_from_latest(frame: pd.DataFrame, preset: str, custom_groups: list[str] | None) -> list[str]:
@@ -771,10 +877,7 @@ def selected_groups_for_frame(dataset: str, frame: pd.DataFrame, preset: str, cu
 
 
 def maturity_subset_options(subset_by: str, start_date: str, end_date: str, current_values: list[str] | None) -> tuple[list[dict[str, str]], list[str], str]:
-    frame = FUND_DETAIL_HOLDINGS[
-        (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
-    ].copy()
+    frame = detail_frame_by_date(start_date, end_date)
     if subset_by == "market":
         return [], [], "All holdings in the selected date range."
 
@@ -1654,6 +1757,12 @@ app.layout = html.Div([dcc.Location(id="url"), html.Div(id="app-shell")])
 
 
 def resolve_issuer_selection(selection: str) -> tuple[str, list[str]]:
+    label, norms_key = _resolve_issuer_selection_cached(selection)
+    return label, list(norms_key)
+
+
+@lru_cache(maxsize=256)
+def _resolve_issuer_selection_cached(selection: str) -> tuple[str, tuple[str, ...]]:
     if selection in ISSUER_PRESETS:
         preset = ISSUER_PRESETS[selection]
         norms = []
@@ -1664,13 +1773,13 @@ def resolve_issuer_selection(selection: str) -> tuple[str, list[str]]:
                 mask = ISSUER_LOOKUP["issuer_norm"].str.contains(pattern, regex=False)
             norms.extend(ISSUER_LOOKUP.loc[mask, "issuer_norm"].tolist())
         norms = sorted(set(norms))
-        return preset["label"], norms
+        return preset["label"], tuple(norms)
     if selection.startswith("norm::"):
         norm = selection.split("norm::", 1)[1]
         match = ISSUER_LOOKUP.loc[ISSUER_LOOKUP["issuer_norm"] == norm]
         label = match["issuer_display"].iloc[0] if not match.empty else norm
-        return label, [norm]
-    return selection, []
+        return label, (norm,)
+    return selection, tuple()
 
 
 def inferred_window(selection: str, preset: str) -> tuple[str, str]:
@@ -1695,6 +1804,98 @@ def issuer_group_source(grouping: str) -> pd.DataFrame:
     return ISSUER_CATEGORY if grouping == "category" else ISSUER_TYPE
 
 
+def issuer_group_frame(grouping: str, norms: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    norms_key = freeze_string_values(norms)
+    return _issuer_group_frame_cached(grouping, norms_key, start_date, end_date).copy()
+
+
+@lru_cache(maxsize=128)
+def _issuer_group_frame_cached(
+    grouping: str,
+    norms_key: tuple[str, ...],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    source = issuer_group_source(grouping)
+    return source[
+        (source["issuer_norm"].isin(list(norms_key)))
+        & (source["as_of_date"] >= pd.Timestamp(start_date))
+        & (source["as_of_date"] <= pd.Timestamp(end_date))
+    ].copy()
+
+
+def issuer_exposure_frame(norms: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    norms_key = freeze_string_values(norms)
+    return _issuer_exposure_frame_cached(norms_key, start_date, end_date).copy()
+
+
+@lru_cache(maxsize=128)
+def _issuer_exposure_frame_cached(
+    norms_key: tuple[str, ...],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    return ISSUER_EXPOSURE[
+        (ISSUER_EXPOSURE["issuer_norm"].isin(list(norms_key)))
+        & (ISSUER_EXPOSURE["as_of_date"] >= pd.Timestamp(start_date))
+        & (ISSUER_EXPOSURE["as_of_date"] <= pd.Timestamp(end_date))
+    ].copy()
+
+
+def issuer_maturity_frame(norms: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    norms_key = freeze_string_values(norms)
+    return _issuer_maturity_frame_cached(norms_key, start_date, end_date).copy()
+
+
+@lru_cache(maxsize=128)
+def _issuer_maturity_frame_cached(
+    norms_key: tuple[str, ...],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    return ISSUER_MATURITY[
+        (ISSUER_MATURITY["issuer_norm"].isin(list(norms_key)))
+        & (ISSUER_MATURITY["as_of_date"] >= pd.Timestamp(start_date))
+        & (ISSUER_MATURITY["as_of_date"] <= pd.Timestamp(end_date))
+    ].copy()
+
+
+def issuer_detail_frame(norms: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    norms_key = freeze_string_values(norms)
+    return _issuer_detail_frame_cached(norms_key, start_date, end_date).copy()
+
+
+@lru_cache(maxsize=128)
+def _issuer_detail_frame_cached(
+    norms_key: tuple[str, ...],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    return FUND_DETAIL_HOLDINGS[
+        (FUND_DETAIL_HOLDINGS["issuer_norm"].isin(list(norms_key)))
+        & (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
+        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
+    ].copy()
+
+
+def fund_detail_frame(funds: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    funds_key = freeze_string_values(funds)
+    return _fund_detail_frame_cached(funds_key, start_date, end_date).copy()
+
+
+@lru_cache(maxsize=128)
+def _fund_detail_frame_cached(
+    funds_key: tuple[str, ...],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    return FUND_DETAIL_HOLDINGS[
+        (FUND_DETAIL_HOLDINGS["fund"].isin(list(funds_key)))
+        & (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
+        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
+    ].copy()
+
+
 def issuer_group_label(grouping: str, group_name: str) -> str:
     if grouping == "category":
         return CATEGORY_SHORT_LABELS.get(group_name, group_name)
@@ -1702,8 +1903,7 @@ def issuer_group_label(grouping: str, group_name: str) -> str:
 
 
 def issuer_group_options(grouping: str, norms: list[str], start_date: str, end_date: str, preset: str, current_groups: list[str] | None) -> tuple[list[dict[str, str]], list[str]]:
-    source = issuer_group_source(grouping)
-    frame = source[(source["issuer_norm"].isin(norms)) & (source["as_of_date"] >= pd.Timestamp(start_date)) & (source["as_of_date"] <= pd.Timestamp(end_date))].copy()
+    frame = issuer_group_frame(grouping, norms, start_date, end_date)
     if frame.empty:
         return [], []
     frame = frame.groupby(["as_of_date", "category" if grouping == "category" else "group_name"], as_index=False)["value"].sum()
@@ -1723,7 +1923,7 @@ def issuer_group_options(grouping: str, norms: list[str], start_date: str, end_d
 
 def build_issuer_exposure_figure(norms: list[str], start_date: str, end_date: str, issuer_label: str, selected_date: pd.Timestamp | None) -> go.Figure:
     dates = ALL_DATES[(ALL_DATES >= pd.Timestamp(start_date)) & (ALL_DATES <= pd.Timestamp(end_date))]
-    holdings = ISSUER_EXPOSURE[(ISSUER_EXPOSURE["issuer_norm"].isin(norms)) & (ISSUER_EXPOSURE["as_of_date"] >= pd.Timestamp(start_date)) & (ISSUER_EXPOSURE["as_of_date"] <= pd.Timestamp(end_date))]
+    holdings = issuer_exposure_frame(norms, start_date, end_date)
     holdings = (
         holdings.groupby("as_of_date", as_index=False)
         .agg(value=("value", "sum"), market_share=("market_share", "sum"))
@@ -1761,9 +1961,8 @@ def build_issuer_exposure_figure(norms: list[str], start_date: str, end_date: st
 
 
 def build_issuer_mix_figure(norms: list[str], grouping: str, groups: list[str], start_date: str, end_date: str, metric: str, issuer_label: str, selected_date: pd.Timestamp | None) -> go.Figure:
-    source = issuer_group_source(grouping)
     name_col = "category" if grouping == "category" else "group_name"
-    frame = source[(source["issuer_norm"].isin(norms)) & (source["as_of_date"] >= pd.Timestamp(start_date)) & (source["as_of_date"] <= pd.Timestamp(end_date))].copy()
+    frame = issuer_group_frame(grouping, norms, start_date, end_date)
     if groups:
         frame = frame[frame[name_col].isin(groups)]
     singular_label, _ = grouping_labels(grouping)
@@ -1803,7 +2002,7 @@ def build_issuer_mix_figure(norms: list[str], grouping: str, groups: list[str], 
 
 
 def build_issuer_maturity_figure(norms: list[str], start_date: str, end_date: str, issuer_label: str, selected_date: pd.Timestamp | None) -> go.Figure:
-    frame = ISSUER_MATURITY[(ISSUER_MATURITY["issuer_norm"].isin(norms)) & (ISSUER_MATURITY["as_of_date"] >= pd.Timestamp(start_date)) & (ISSUER_MATURITY["as_of_date"] <= pd.Timestamp(end_date))].copy()
+    frame = issuer_maturity_frame(norms, start_date, end_date)
     if frame.empty:
         fig = go.Figure()
         fig.update_layout(title=f"{issuer_label}: no maturity data in selected window")
@@ -1840,9 +2039,8 @@ def issuer_snapshot_table(
     end_date: str,
     selected_date: str | pd.Timestamp | None,
 ) -> list[dict[str, str]]:
-    source = issuer_group_source(grouping)
     name_col = "category" if grouping == "category" else "group_name"
-    frame = source[(source["issuer_norm"].isin(norms)) & (source["as_of_date"] >= pd.Timestamp(start_date)) & (source["as_of_date"] <= pd.Timestamp(end_date))].copy()
+    frame = issuer_group_frame(grouping, norms, start_date, end_date)
     if groups:
         frame = frame[frame[name_col].isin(groups)]
     if frame.empty:
@@ -1868,11 +2066,7 @@ def build_issuer_maturity_distribution_figure(
     end_date: str,
     selected_date: pd.Timestamp | None,
 ) -> go.Figure:
-    subset = OVERVIEW_HOLDINGS[
-        (OVERVIEW_HOLDINGS["issuer_norm"].isin(norms))
-        & (OVERVIEW_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
-        & (OVERVIEW_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
-    ].copy()
+    subset = issuer_detail_frame(norms, start_date, end_date)
     snapshot_date = resolve_snapshot_date(selected_date, subset["as_of_date"])
     subset = subset[subset["as_of_date"] == snapshot_date].copy()
     if type_groups:
@@ -1927,11 +2121,7 @@ def resolve_fund_selection(selection: str | None) -> tuple[str, list[str]]:
 
 def fund_group_options(grouping: str, funds: list[str], start_date: str, end_date: str, preset: str, current_groups: list[str] | None) -> tuple[list[dict[str, str]], list[str]]:
     name_col = "category" if grouping == "category" else "type"
-    frame = FUND_DETAIL_HOLDINGS[
-        (FUND_DETAIL_HOLDINGS["fund"].isin(funds))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
-    ].copy()
+    frame = fund_detail_frame(funds, start_date, end_date)
     frame = frame[frame[name_col] != ""]
     if frame.empty:
         return [], []
@@ -1950,11 +2140,7 @@ def fund_group_options(grouping: str, funds: list[str], start_date: str, end_dat
 
 def build_fund_exposure_figure(funds: list[str], start_date: str, end_date: str, fund_label: str, selected_date: pd.Timestamp | None) -> go.Figure:
     dates = ALL_DATES[(ALL_DATES >= pd.Timestamp(start_date)) & (ALL_DATES <= pd.Timestamp(end_date))]
-    holdings = FUND_DETAIL_HOLDINGS[
-        (FUND_DETAIL_HOLDINGS["fund"].isin(funds))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
-    ]
+    holdings = fund_detail_frame(funds, start_date, end_date)
     holdings = (
         holdings.groupby("as_of_date", as_index=False)
         .agg(value=("value", "sum"))
@@ -1993,11 +2179,7 @@ def build_fund_exposure_figure(funds: list[str], start_date: str, end_date: str,
 
 def build_fund_mix_figure(funds: list[str], grouping: str, groups: list[str], start_date: str, end_date: str, metric: str, fund_label: str, selected_date: pd.Timestamp | None) -> go.Figure:
     name_col = "category" if grouping == "category" else "type"
-    frame = FUND_DETAIL_HOLDINGS[
-        (FUND_DETAIL_HOLDINGS["fund"].isin(funds))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
-    ].copy()
+    frame = fund_detail_frame(funds, start_date, end_date)
     frame = frame[frame[name_col] != ""]
     if groups:
         frame = frame[frame[name_col].isin(groups)]
@@ -2035,11 +2217,7 @@ def build_fund_mix_figure(funds: list[str], grouping: str, groups: list[str], st
 
 
 def build_fund_maturity_figure(funds: list[str], start_date: str, end_date: str, fund_label: str, selected_date: pd.Timestamp | None) -> go.Figure:
-    frame = FUND_DETAIL_HOLDINGS[
-        (FUND_DETAIL_HOLDINGS["fund"].isin(funds))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
-    ].copy()
+    frame = fund_detail_frame(funds, start_date, end_date)
     frame = frame.dropna(subset=["weight"])
     if frame.empty:
         fig = go.Figure()
@@ -2074,11 +2252,7 @@ def fund_snapshot_table(
     selected_date: str | pd.Timestamp | None,
 ) -> list[dict[str, str]]:
     name_col = "category" if grouping == "category" else "type"
-    frame = FUND_DETAIL_HOLDINGS[
-        (FUND_DETAIL_HOLDINGS["fund"].isin(funds))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
-    ].copy()
+    frame = fund_detail_frame(funds, start_date, end_date)
     frame = frame[frame[name_col] != ""]
     if groups:
         frame = frame[frame[name_col].isin(groups)]
@@ -2105,11 +2279,7 @@ def build_fund_maturity_distribution_figure(
     end_date: str,
     selected_date: pd.Timestamp | None,
 ) -> go.Figure:
-    subset = FUND_DETAIL_HOLDINGS[
-        (FUND_DETAIL_HOLDINGS["fund"].isin(funds))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
-    ].copy()
+    subset = fund_detail_frame(funds, start_date, end_date)
     snapshot_date = resolve_snapshot_date(selected_date, subset["as_of_date"])
     subset = subset[subset["as_of_date"] == snapshot_date].copy()
     if type_groups:
@@ -2833,7 +3003,7 @@ def update_country_snapshot_panel(selection: dict | None, start_date: str, end_d
         return empty, empty, empty, [], [], "Country breakout snapshot", "Region breakout snapshot"
     selected_date = resolve_snapshot_date((selection or {}).get("as_of_date", end_date), country_frame["as_of_date"])
     timeline_fig = build_breakdown_timeline_figure(
-        OVERVIEW_HOLDINGS[(OVERVIEW_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date)) & (OVERVIEW_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))],
+        overview_holdings_by_date(start_date, end_date),
         selected_date,
     )
     country_groups = groups or (
@@ -2885,11 +3055,7 @@ def sync_maturity_subset_values(subset_by: str, start_date: str, end_date: str, 
     Input("mt-groups", "value"),
 )
 def update_maturity(metric: str, chart_mode: str, subset_by: str, subset_values: list[str], start_date: str, end_date: str, groups: list[str]):
-    detail_frame = FUND_DETAIL_HOLDINGS[
-        (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
-    ].copy()
-    detail_frame = filter_maturity_subset(detail_frame, subset_by, subset_values)
+    detail_frame = detail_frame_for_subset(start_date, end_date, subset_by, subset_values)
     detail_frame = detail_frame.dropna(subset=["as_of_date", "value", "maturity_date"])
     if detail_frame.empty:
         empty = go.Figure()
@@ -3128,13 +3294,13 @@ def update_issuer_page(selection: str, start_date: str, end_date: str, type_grou
         )
 
     dates = ALL_DATES[(ALL_DATES >= pd.Timestamp(start_date)) & (ALL_DATES <= pd.Timestamp(end_date))]
-    exposure_frame = ISSUER_EXPOSURE[(ISSUER_EXPOSURE["issuer_norm"].isin(norms)) & (ISSUER_EXPOSURE["as_of_date"] >= pd.Timestamp(start_date)) & (ISSUER_EXPOSURE["as_of_date"] <= pd.Timestamp(end_date))]
+    exposure_frame = issuer_exposure_frame(norms, start_date, end_date)
     exposure_series = exposure_frame.groupby("as_of_date", as_index=False).agg(value=("value", "sum"), market_share=("market_share", "sum")).set_index("as_of_date").reindex(dates).fillna(0.0).reset_index()
     peak_row = exposure_series.sort_values("value", ascending=False).iloc[0]
     start_value = exposure_series.iloc[0]["value"]
     end_value = exposure_series.iloc[-1]["value"]
     delta = end_value - start_value
-    maturity_frame = ISSUER_MATURITY[(ISSUER_MATURITY["issuer_norm"].isin(norms)) & (ISSUER_MATURITY["as_of_date"] >= pd.Timestamp(start_date)) & (ISSUER_MATURITY["as_of_date"] <= pd.Timestamp(end_date))]
+    maturity_frame = issuer_maturity_frame(norms, start_date, end_date)
     if maturity_frame.empty:
         latest_wam = float("nan")
         latest_wafm = float("nan")
@@ -3280,11 +3446,7 @@ def update_fund_description(selection: str, start_date: str, end_date: str):
     fund_label, funds = resolve_fund_selection(selection)
     if not funds:
         return "No matching fund was found for this selection."
-    subset = FUND_DETAIL_HOLDINGS[
-        (FUND_DETAIL_HOLDINGS["fund"].isin(funds))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
-    ]
+    subset = fund_detail_frame(funds, start_date, end_date)
     family = subset["fund_family"].replace("", pd.NA).dropna().mode()
     fund_type = subset["fund_type"].replace("", pd.NA).dropna().mode()
     family_text = family.iloc[0] if not family.empty else "n/a"
@@ -3365,11 +3527,7 @@ def update_fund_page(selection: str, start_date: str, end_date: str, type_groups
         )
 
     dates = ALL_DATES[(ALL_DATES >= pd.Timestamp(start_date)) & (ALL_DATES <= pd.Timestamp(end_date))]
-    fund_frame = FUND_DETAIL_HOLDINGS[
-        (FUND_DETAIL_HOLDINGS["fund"].isin(funds))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] >= pd.Timestamp(start_date))
-        & (FUND_DETAIL_HOLDINGS["as_of_date"] <= pd.Timestamp(end_date))
-    ].copy()
+    fund_frame = fund_detail_frame(funds, start_date, end_date)
     exposure_series = (
         fund_frame.groupby("as_of_date", as_index=False)
         .agg(value=("value", "sum"))
